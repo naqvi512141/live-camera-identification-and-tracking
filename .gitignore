@@ -1,0 +1,20 @@
+# Ignore Virtual Environment
+venv/
+env/
+ENV/
+
+# Ignore Sensitive Environment Files (Passwords/IPs)
+.env
+
+# Ignore Python Cache & Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore Local Models
+*.pt
+
+# Ignore IDE settings & local OS files
+.vscode/
+.DS_Store
