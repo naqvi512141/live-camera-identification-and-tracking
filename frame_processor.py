@@ -1,10 +1,23 @@
 """
 frame_processor.py
 -------------------
-Adds proper track LIFECYCLE management: tracks that disappear are
-removed from active bookkeeping after a short grace period, freeing
-their global_id for correct re-matching on return. Also skips ReID
-on heavily-overlapping boxes (likely contaminated crops).
+Pipeline per frame:
+  1. YOLOv8n (GPU) detects people
+  2. ByteTrack assigns a short-term, per-camera track_id
+  3. Track LIFECYCLE management: tracks not seen for a grace period
+     are purged from "active" bookkeeping, freeing their global_id
+     for correct re-matching on return (see _cleanup_dead_tracks)
+  4. On a NEW, stable, good-quality track -> ReID match/register
+     against the shared Gallery using embedding + color histogram,
+     excluding IDs already active on OTHER currently-visible tracks
+  5. On an ALREADY-known track -> periodically enrich its identity's
+     embedding bank and color profile with fresh good-quality crops
+  6. Draw a box + label in a color derived deterministically from the
+     global ID (same ID = same color, always)
+
+"Good quality" crop = not heavily overlapping another box, not
+touching the frame edge (partial body), and large enough to be a
+reliable ReID reference.
 """
 
 import cv2
@@ -12,32 +25,44 @@ import colorsys
 from ultralytics import YOLO
 
 from reid_extractor import get_embedding
+from color_signature import get_color_signature
 from gallery import Gallery
 
+# --- detection / tracking settings ---
 PERSON_CLASS_ID = 0
 CONFIDENCE_THRESHOLD = 0.5
-MIN_TRACK_AGE = 3
+NMS_IOU = 0.75              # raised from default 0.7 -- helps avoid merging two close people
+
+# --- ReID quality-gate settings ---
+MIN_TRACK_AGE = 3            # frames a track must persist before we trust it for ReID
 MIN_CROP_WIDTH = 40
 MIN_CROP_HEIGHT = 100
-MISSED_FRAME_GRACE = 8       # ~0.3s at 25fps — tolerate brief detection blips
-OVERLAP_IOU_SKIP = 0.3       # skip ReID if this box overlaps another this much
+EDGE_MARGIN = 5               # px -- box this close to frame border = likely partial body
+OVERLAP_IOU_SKIP = 0.3        # skip ReID if box overlaps another this much (contaminated crop)
+UPDATE_EVERY_N_FRAMES = 15    # ~twice a second at 25fps -- periodic bank enrichment
+
+# --- track lifecycle ---
+MISSED_FRAME_GRACE = 8        # ~0.3s at 25fps -- tolerate brief detection blips before purging
 
 _models = {}
 _gallery = Gallery()
-_known_track_ids = {}
-_track_to_global = {}
-_track_seen_count = {}
-_track_missed_count = {}     # cam_name -> {track_id: consecutive-missed-frames}
-_color_cache = {}
+_known_track_ids = {}         # cam_name -> set(track_id) already ReID'd
+_track_to_global = {}         # cam_name -> {track_id: global_id}
+_track_seen_count = {}        # cam_name -> {track_id: consecutive frames seen}
+_track_missed_count = {}      # cam_name -> {track_id: consecutive frames missed}
+_color_cache = {}             # identity -> (B, G, R)
 
 
 def _get_model(cam_name):
     if cam_name not in _models:
-        _models[cam_name] = YOLO("yolov8n.pt")
+        _models[cam_name] = YOLO("yolo11x.pt")
     return _models[cam_name]
 
 
 def _active_global_ids(exclude_cam=None, exclude_track=None):
+    """Every global_id currently owned by a live, already-known track,
+    across ALL cameras -- used so ReID never assigns an ID that's
+    actively in use by a different, currently-visible person."""
     active = set()
     for cam, mapping in _track_to_global.items():
         for tid, gid in mapping.items():
@@ -61,11 +86,17 @@ def _iou(box_a, box_b):
     return inter / float(area_a + area_b - inter)
 
 
+def _touches_edge(x1, y1, x2, y2, frame_w, frame_h):
+    return (x1 <= EDGE_MARGIN or y1 <= EDGE_MARGIN
+            or x2 >= frame_w - EDGE_MARGIN or y2 >= frame_h - EDGE_MARGIN)
+
+
 def _cleanup_dead_tracks(cam_name, current_track_ids):
-    """Remove bookkeeping for tracks ByteTrack hasn't reported in a
-    while, freeing their global_id from the 'active' exclusion set.
-    The gallery's stored embeddings are untouched — only THIS active
-    bookkeeping resets, so the person can still be re-recognized."""
+    """Remove bookkeeping for tracks ByteTrack hasn't reported for
+    MISSED_FRAME_GRACE frames, freeing their global_id from the
+    'active' exclusion set. The gallery's stored embeddings are
+    NOT touched here -- only this per-camera active bookkeeping
+    resets, so the person can still be correctly re-recognized."""
     missed = _track_missed_count.setdefault(cam_name, {})
     mapping = _track_to_global.setdefault(cam_name, {})
     known = _known_track_ids.setdefault(cam_name, set())
@@ -84,15 +115,19 @@ def _cleanup_dead_tracks(cam_name, current_track_ids):
 
 
 def _color_for_id(identity):
+    """Deterministic, well-separated color per identity, derived from
+    the ID itself (golden-angle hue spacing) so consecutive IDs never
+    look visually similar, and the same ID always gets the same color."""
     if identity in _color_cache:
         return _color_cache[identity]
     try:
         n = int(identity)
     except (TypeError, ValueError):
-        return (160, 160, 160)
+        return (160, 160, 160)   # neutral gray for provisional "?N" labels
+
     hue = (n * 0.618033988749895) % 1.0
     r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
-    color = (int(b * 255), int(g * 255), int(r * 255))
+    color = (int(b * 255), int(g * 255), int(r * 255))  # BGR for OpenCV
     _color_cache[identity] = color
     return color
 
@@ -101,10 +136,14 @@ def _draw_label(frame, x1, y1, x2, y2, text, color):
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale, font_thickness = 1.0, 2
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
     (tw, th), baseline = cv2.getTextSize(text, font, font_scale, font_thickness)
-    ly1, ly2 = max(y1 - th - baseline - 8, 0), max(y1, th + baseline + 8)
-    cv2.rectangle(frame, (x1, ly1), (x1 + tw + 10, ly2), color, -1)
-    cv2.putText(frame, text, (x1 + 5, ly2 - baseline - 4), font, font_scale, (0, 0, 0), font_thickness)
+    ly1 = max(y1 - th - baseline - 8, 0)
+    ly2 = max(y1, th + baseline + 8)
+
+    cv2.rectangle(frame, (x1, ly1), (x1 + tw + 10, ly2), color, -1)   # filled bg for readability
+    cv2.putText(frame, text, (x1 + 5, ly2 - baseline - 4),
+                font, font_scale, (0, 0, 0), font_thickness)
 
 
 def process_frame(cam_name, frame, frame_id):
@@ -113,15 +152,22 @@ def process_frame(cam_name, frame, frame_id):
     _track_to_global.setdefault(cam_name, {})
     _track_seen_count.setdefault(cam_name, {})
 
+    frame_h, frame_w = frame.shape[:2]
+
     results = model.track(
-        frame, persist=True, tracker="bytetrack.yaml",
-        conf=CONFIDENCE_THRESHOLD, classes=[PERSON_CLASS_ID],
-        device=0, verbose=False,
+        frame,
+        persist=True,
+        tracker="botsort.yaml",
+        conf=CONFIDENCE_THRESHOLD,
+        iou=NMS_IOU,
+        classes=[PERSON_CLASS_ID],
+        device=0,          # use the GPU
+        verbose=False,
     )[0]
 
     all_boxes = [tuple(map(int, b.xyxy[0])) for b in results.boxes]
     current_track_ids = {int(b.id[0]) for b in results.boxes if b.id is not None}
-    _cleanup_dead_tracks(cam_name, current_track_ids)   # <-- the actual fix
+    _cleanup_dead_tracks(cam_name, current_track_ids)
 
     person_count = 0
 
@@ -135,28 +181,44 @@ def process_frame(cam_name, frame, frame_id):
         _track_seen_count[cam_name][track_id] = _track_seen_count[cam_name].get(track_id, 0) + 1
         crop_w, crop_h = (x2 - x1), (y2 - y1)
 
-        # heavy overlap with another box this frame -> likely contaminated crop
         overlapping = any(_iou((x1, y1, x2, y2), other) >= OVERLAP_IOU_SKIP
                            for j, other in enumerate(all_boxes) if j != i)
+        on_edge = _touches_edge(x1, y1, x2, y2, frame_w, frame_h)
+        big_enough = crop_w >= MIN_CROP_WIDTH and crop_h >= MIN_CROP_HEIGHT
+        good_quality = (not overlapping) and (not on_edge) and big_enough
+
+        # --- DIAGNOSTIC PRINT ---
+        if not good_quality:
+            print(f"[{cam_name}] track {track_id} REJECTED: "
+                  f"overlap={overlapping} edge={on_edge} size=({crop_w}x{crop_h})")
 
         if track_id not in _known_track_ids[cam_name]:
             stable_enough = _track_seen_count[cam_name][track_id] >= MIN_TRACK_AGE
-            big_enough = crop_w >= MIN_CROP_WIDTH and crop_h >= MIN_CROP_HEIGHT
 
-            if stable_enough and big_enough and not overlapping:
+            if stable_enough and good_quality:
                 crop = frame[max(y1, 0):y2, max(x1, 0):x2]
                 embedding = get_embedding(crop)
+                color_hist = get_color_signature(crop)
+
                 if embedding is not None:
                     exclude = _active_global_ids(exclude_cam=cam_name, exclude_track=track_id)
-                    global_id = _gallery.match_or_register(embedding, exclude_ids=exclude)
+                    global_id = _gallery.match_or_register(embedding, color_hist, exclude_ids=exclude)
                     _track_to_global[cam_name][track_id] = global_id
                     _known_track_ids[cam_name].add(track_id)
                 else:
                     global_id = f"?{track_id}"
             else:
-                global_id = f"?{track_id}"
+                global_id = f"?{track_id}"   # not confident yet -- shown, not finalized
         else:
             global_id = _track_to_global[cam_name].get(track_id, track_id)
+            # periodically enrich this identity's bank and color with fresh crops
+            if good_quality and _track_seen_count[cam_name][track_id] % UPDATE_EVERY_N_FRAMES == 0:
+                crop = frame[max(y1, 0):y2, max(x1, 0):x2]
+                embedding = get_embedding(crop)
+                color_hist = get_color_signature(crop)
+
+                if embedding is not None:
+                    _gallery.update(global_id, embedding, color_hist=color_hist)
 
         color = _color_for_id(global_id)
         _draw_label(frame, x1, y1, x2, y2, f"ID {global_id} | {confidence:.2f}", color)
